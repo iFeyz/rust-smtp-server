@@ -1,0 +1,18 @@
+[package]
+name = "smtp-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.0", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tokio-native-tls = "0.3"
+native-tls = "0.2"
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1.0"
+regex = "1.0"
+openssl = "0.10"
+trust-dns-resolver = "0.22"
+trust-dns-proto = "0.22"
