@@ -8,12 +8,9 @@ use tokio_util::codec::{Framed, LinesCodec};
 use futures::{stream::iter, SinkExt, StreamExt};
 use native_tls::{Identity, TlsAcceptor};
 use tokio_native_tls::{TlsAcceptor as TokioTlsAcceptor, TlsStream};
-use trust_dns_resolver::{
-    config::{ResolverConfig , ResolverOpts},
-    AsyncResolver,
-    proto::rr::{RData , RecordType}
-};
-
+use std::net::UdpSocket;
+mod dns_resolver;
+use dns_resolver::DnsRecord;
 use openssl::{
 
     asn1::Asn1Time,
@@ -24,7 +21,6 @@ use openssl::{
         X509NameBuilder, X509,
     },
 };
-
 
 // Définition de l'enum SmtpState
 #[derive(Debug)]
@@ -369,28 +365,6 @@ fn generate_certificate() -> anyhow::Result<(String, String)> {
     cert_result.map_err(|e: openssl::error::ErrorStack| anyhow::anyhow!("Could not generate self-signed certificates: {}", e))
 }
 
-async fn get_mx_records(domain: &str) -> anyhow::Result<Vec<(u16, String)>> {
-    let resolver = AsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default())?;
-    let response = resolver.lookup(domain, RecordType::MX).await?;
-    
-    let mut mx_records = Vec::new();
-    for record in response.iter() {
-        if let RData::MX(mx) = record {
-            mx_records.push((mx.preference(), mx.exchange().to_string()));
-        }
-    }
-    
-    // Trier par préférence (plus petit = plus prioritaire)
-    mx_records.sort_by_key(|(pref, _)| *pref);
-    Ok(mx_records)
-}
-
-async fn get_a_records(server: &str) -> anyhow::Result<Vec<std::net::IpAddr>> {
-    let resolver = AsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default())?;
-    let response = resolver.lookup_ip(server).await?;
-    Ok(response.iter().collect())
-}
-
 async fn send_mail_not_in_domain(email: &Email) -> anyhow::Result<()> {
     tracing::info!("Starting email forwarding process");
     
@@ -398,43 +372,21 @@ async fn send_mail_not_in_domain(email: &Email) -> anyhow::Result<()> {
     let domain = email.receiver.split('@').nth(1)
         .ok_or_else(|| anyhow::anyhow!("Invalid recipient address"))?;
     
-    // Configuration spéciale pour Gmail
-    if domain == "gmail.com" {
-        tracing::info!("Gmail detected, using Gmail SMTP servers");
-        let gmail_servers = vec![
-            "smtp.gmail.com:587",
-            "alt1.gmail-smtp-in.l.google.com:587",
-            "alt2.gmail-smtp-in.l.google.com:587",
-            "alt3.gmail-smtp-in.l.google.com:587",
-            "alt4.gmail-smtp-in.l.google.com:587",
-        ];
-        
-        for server in gmail_servers {
-            match TcpStream::connect(server).await {
-                Ok(stream) => {
-                    tracing::info!("Connected to Gmail SMTP server: {}", server);
-                    match send_smtp_mail_tls(stream, email).await {
-                        Ok(_) => {
-                            tracing::info!("Successfully forwarded email to {} via {}", email.receiver, server);
-                            return Ok(());
-                        }
-                        Err(e) => {
-                            tracing::error!("Failed to send email through {}: {}", server, e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to connect to Gmail server {}: {}", server, e);
-                }
-            }
-        }
-        return Err(anyhow::anyhow!("Failed to send email to Gmail after trying all servers"));
+    // Configuration pour les serveurs sécurisés connus
+    let smtp_config = match domain {
+        "gmail.com" => Some(("smtp.gmail.com", 587)),
+        "outlook.com" | "hotmail.com" => Some(("smtp.office365.com", 587)),
+        "yahoo.com" => Some(("smtp.mail.yahoo.com", 587)),
+        _ => None
+    };
+
+    if let Some((server, port)) = smtp_config {
+        tracing::info!("Using secure SMTP server {}:{}", server, port);
+        let stream = TcpStream::connect((server, port)).await?;
+        return send_smtp_mail_tls(stream, email, server).await;
     }
-    
-    // Pour les autres domaines, continuer avec la logique existante...
-    tracing::debug!("Resolving MX records for domain: {}", domain);
-    
-    // Obtenir les enregistrements MX
+
+    // Pour les autres domaines, utiliser les MX records mais avec le port 587
     let mx_records = get_mx_records(domain).await?;
     if mx_records.is_empty() {
         tracing::error!("No MX records found for domain {}", domain);
@@ -451,12 +403,12 @@ async fn send_mail_not_in_domain(email: &Email) -> anyhow::Result<()> {
             Ok(ips) => {
                 tracing::debug!("Resolved {} to {} IP addresses", mx_server, ips.len());
                 for ip in ips {
-                    tracing::debug!("Attempting connection to SMTP server at {}:25", ip);
-                    // Tenter de se connecter au serveur SMTP
-                    match TcpStream::connect((ip, 25)).await {
+                    tracing::debug!("Attempting connection to SMTP server at {}:587", ip);
+                    // Tenter de se connecter au serveur SMTP sur le port 587
+                    match TcpStream::connect((ip, 465)).await {
                         Ok(stream) => {
-                            tracing::info!("Connected to SMTP server at {}:25", ip);
-                            match send_smtp_mail(stream, email).await {
+                            tracing::info!("Connected to SMTP server at {}:465", ip);
+                            match send_smtp_mail_tls(stream, email, &mx_server).await {
                                 Ok(_) => {
                                     tracing::info!("Successfully forwarded email to {} via {}", email.receiver, ip);
                                     return Ok(());
@@ -467,7 +419,7 @@ async fn send_mail_not_in_domain(email: &Email) -> anyhow::Result<()> {
                             }
                         }
                         Err(e) => {
-                            tracing::warn!("Failed to connect to {}: {}", ip, e);
+                            tracing::warn!("Failed to connect to {}:587: {}", ip, e);
                         }
                     }
                 }
@@ -570,72 +522,133 @@ async fn send_smtp_mail(mut stream: TcpStream, email: &Email) -> anyhow::Result<
     Ok(())
 }
 
-async fn send_smtp_mail_tls(mut stream: TcpStream, email: &Email) -> anyhow::Result<()> {
-    let (read_half, write_half) = stream.split();
-    let mut writer = BufWriter::new(write_half);
-    let mut reader = BufReader::new(read_half);
-    
-    // Lire le message de bienvenue
-    let mut greeting = String::new();
-    reader.read_line(&mut greeting).await?;
-    tracing::debug!("Server greeting: {}", greeting.trim());
-    
-    // EHLO
-    writer.write_all(b"EHLO localhost\r\n").await?;
-    writer.flush().await?;
-    
-    // Lire toutes les réponses EHLO
-    let responses = read_smtp_response(&mut reader).await?;
-    
-    // Vérifier si STARTTLS est supporté
-    if !responses.iter().any(|r| r.contains("STARTTLS")) {
-        return Err(anyhow::anyhow!("STARTTLS not supported by server"));
-    }
-    
-    // STARTTLS
-    writer.write_all(b"STARTTLS\r\n").await?;
-    writer.flush().await?;
-    
-    let mut response = String::new();
-    reader.read_line(&mut response).await?;
-    if !response.starts_with("220") {
-        return Err(anyhow::anyhow!("STARTTLS failed: {}", response));
-    }
-    
-    // Établir la connexion TLS
+async fn send_smtp_mail_tls(mut stream: TcpStream, email: &Email, server_name: &str) -> anyhow::Result<()> {
+    // Établir la connexion TLS directement (pas besoin de STARTTLS pour le port 465)
     let tls_connector = native_tls::TlsConnector::builder()
         .min_protocol_version(Some(native_tls::Protocol::Tlsv12))
         .build()?;
     let tls_connector = tokio_native_tls::TlsConnector::from(tls_connector);
-    let tls_stream = tls_connector.connect("smtp.gmail.com", stream).await?;
-    
+    let tls_stream = tls_connector.connect(server_name, stream).await?;
+
     let (read_half, write_half) = tokio::io::split(tls_stream);
     let mut writer = BufWriter::new(write_half);
     let mut reader = BufReader::new(read_half);
+    let mut response = String::new();
+
+    // Lire le message de bienvenue
+    reader.read_line(&mut response).await?;
+    tracing::debug!("Server greeting: {}", response.trim());
     
-    // EHLO après TLS
+    // EHLO
     writer.write_all(b"EHLO localhost\r\n").await?;
+    writer.flush().await?;
+    let responses = read_smtp_response(&mut reader).await?;
+    tracing::debug!("EHLO responses: {:?}", responses);
+
+    // AUTH LOGIN
+    let username = std::env::var("SMTP_USERNAME")?;
+    let password = std::env::var("SMTP_PASSWORD")?;
+
+    writer.write_all(b"AUTH LOGIN\r\n").await?;
     writer.flush().await?;
     response.clear();
     reader.read_line(&mut response).await?;
-    
-    // Continuer avec le reste du protocole SMTP...
-    // MAIL FROM, RCPT TO, DATA, etc.
+    tracing::debug!("AUTH LOGIN response: {}", response.trim());
+
+    // Envoyer le nom d'utilisateur en base64
+    writer.write_all(format!("{}\r\n", base64::encode(username)).as_bytes()).await?;
+    writer.flush().await?;
+    response.clear();
+    reader.read_line(&mut response).await?;
+    tracing::debug!("Username response: {}", response.trim());
+
+    // Envoyer le mot de passe en base64
+    writer.write_all(format!("{}\r\n", base64::encode(password)).as_bytes()).await?;
+    writer.flush().await?;
+    response.clear();
+    reader.read_line(&mut response).await?;
+    tracing::debug!("Password response: {}", response.trim());
+
+    if !response.starts_with("235") {
+        return Err(anyhow::anyhow!("Authentication failed: {}", response.trim()));
+    }
+
+    // Envoyer le mail
     let mail_from = format!("MAIL FROM:<{}>\r\n", email.sender);
     writer.write_all(mail_from.as_bytes()).await?;
     writer.flush().await?;
     response.clear();
     reader.read_line(&mut response).await?;
+    tracing::debug!("MAIL FROM response: {}", response.trim());
     
     let rcpt_to = format!("RCPT TO:<{}>\r\n", email.receiver);
     writer.write_all(rcpt_to.as_bytes()).await?;
     writer.flush().await?;
     response.clear();
     reader.read_line(&mut response).await?;
+    tracing::debug!("RCPT TO response: {}", response.trim());
     
-    // ... reste du code pour l'envoi du mail ...
+    // DATA
+    writer.write_all(b"DATA\r\n").await?;
+    writer.flush().await?;
+    response.clear();
+    reader.read_line(&mut response).await?;
+    tracing::debug!("DATA response: {}", response.trim());
     
+    // Contenu du mail
+    writer.write_all(format!("From: <{}>\r\n", email.sender).as_bytes()).await?;
+    writer.write_all(format!("To: <{}>\r\n", email.receiver).as_bytes()).await?;
+    writer.write_all(format!("Subject: {}\r\n\r\n", email.subject).as_bytes()).await?;
+    writer.write_all(email.data.as_bytes()).await?;
+    writer.write_all(b"\r\n.\r\n").await?;
+    writer.flush().await?;
+    response.clear();
+    reader.read_line(&mut response).await?;
+    tracing::debug!("End of data response: {}", response.trim());
+    
+    // QUIT
+    writer.write_all(b"QUIT\r\n").await?;
+    writer.flush().await?;
+    response.clear();
+    reader.read_line(&mut response).await?;
+    tracing::debug!("QUIT response: {}", response.trim());
+
     Ok(())
+}
+
+async fn get_mx_records(domain: &str) -> anyhow::Result<Vec<(u16, String)>> {
+    let mut record = DnsRecord::new(domain.to_string());
+    let query = record.create_dns_query(15); // 15 est le type MX
+    
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.send_to(&query, "8.8.8.8:53")?;
+    
+    let mut buf = [0; 512];
+    let (size, _) = socket.recv_from(&mut buf)?;
+    let response = &buf[..size];
+    
+    let mx_records = DnsRecord::parse_mx_records(response);
+    Ok(mx_records)
+}
+
+async fn get_a_records(server: &str) -> anyhow::Result<Vec<std::net::IpAddr>> {
+    let mut record = DnsRecord::new(server.to_string());
+    let query = record.create_dns_query(1); // 1 est le type A
+    
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.send_to(&query, "8.8.8.8:53")?;
+    
+    let mut buf = [0; 512];
+    let (size, _) = socket.recv_from(&mut buf)?;
+    let response = &buf[..size];
+    
+    record.parse_ip(response);
+    
+    let ips = record.get_a_records().iter()
+        .filter_map(|ip| ip.parse::<std::net::IpAddr>().ok())
+        .collect();
+    
+    Ok(ips)
 }
 
 #[tokio::main]
